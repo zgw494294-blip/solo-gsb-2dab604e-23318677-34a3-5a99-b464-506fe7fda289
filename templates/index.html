@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>直流电路网表求解器</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="container">
+    <h1>直流电路网表求解器</h1>
+    <p class="hint">
+      每行输入一个元件：<code>名称 起点 终点 数值</code>。名称首字母：
+      <strong>R</strong>＝电阻（Ω，须为正）、<strong>V</strong>＝理想电压源（V，起点电位 − 终点电位 ＝ 数值）、
+      <strong>I</strong>＝理想电流源（A，正方向：起点 → 终点）。
+      节点 <code>0</code> 为地；最多 12 个非接地节点、30 个元件；名称不得重复；<code>#</code> 开头为注释。
+    </p>
+
+    <label class="label" for="netlist">网表</label>
+    <textarea id="netlist" rows="10" spellcheck="false"
+      placeholder="V1 1 0 12&#10;R1 1 2 6&#10;R2 2 0 6"></textarea>
+
+    <div class="toolbar">
+      <button id="solve-btn" class="primary">求解</button>
+      <button id="example-btn" type="button">填入示例</button>
+      <button id="clear-btn" type="button">清空</button>
+    </div>
+
+    <div id="error" class="error" role="alert" hidden></div>
+
+    <section id="results" hidden>
+      <h2>节点电压</h2>
+      <table id="voltage-table">
+        <thead>
+          <tr><th>节点</th><th>电压 (V)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <h2>元件电流（正方向：起点 → 终点）</h2>
+      <table id="current-table">
+        <thead>
+          <tr><th>元件</th><th>类型</th><th>方向</th><th>电流 (A)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="sensitivity">
+      <h2>灵敏度分析</h2>
+      <p class="hint">
+        选择一个观测量（非接地节点电压，或某元件「起点 → 终点」方向的电流），
+        提交当前网表，得到观测量对每个元件数值的局部导数，
+        以及该元件数值改为原值 1.01 倍时观测量的一阶变化量，按变化量绝对值降序排列。
+      </p>
+      <div class="toolbar">
+        <select id="obs-type" aria-label="观测量类型">
+          <option value="voltage">节点电压</option>
+          <option value="current">元件电流</option>
+        </select>
+        <input id="obs-target" type="text" size="20"
+               placeholder="非接地节点编号，如 2" autocomplete="off">
+        <button id="sens-btn" class="primary">分析灵敏度</button>
+      </div>
+      <div id="sens-output" hidden>
+        <p id="sens-summary" class="summary"></p>
+        <table id="sens-table">
+          <thead>
+            <tr>
+              <th>元件</th><th>类型</th><th>数值</th>
+              <th>局部导数</th><th>1% 变化量（一阶）</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="thevenin">
+      <h2>两端口戴维南等效分析</h2>
+      <p class="hint">
+        指定当前网表中两个<strong>不同</strong>的节点（允许节点 <code>0</code>）与正的有限负载电阻，
+        得到按<strong>第一节点（+）到第二节点（−）</strong>定义的开路电压、等效电阻，
+        以及接入负载后的端口电压、电流与负载功率。
+        等效电阻在原 MNA 系数矩阵上把独立源置零（电压源短路、电流源开路）后，
+        从第二节点向第一节点注入 1 A 求得；端口被理想电压源短接时为 0 Ω。
+        负载电流正方向为<strong>第一节点 → 第二节点</strong>（负值表示实际方向相反），
+        功率恒为非负。交换两个端点时电压、电流变号，功率不变。
+      </p>
+      <div class="toolbar">
+        <label for="th-node1">第一节点（+）</label>
+        <input id="th-node1" type="text" inputmode="numeric" size="6"
+               placeholder="如 2" autocomplete="off">
+        <label for="th-node2">第二节点（−）</label>
+        <input id="th-node2" type="text" inputmode="numeric" size="6"
+               placeholder="如 0" autocomplete="off">
+        <label for="th-load">负载电阻 RL（Ω）</label>
+        <input id="th-load" type="text" inputmode="decimal" size="10"
+               placeholder="如 10" autocomplete="off">
+        <button id="th-btn" class="primary">戴维南等效</button>
+      </div>
+      <div id="th-output" hidden>
+        <p id="th-summary" class="summary"></p>
+        <table id="th-table">
+          <thead>
+            <tr><th>项目</th><th>数值</th><th>说明</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="diagnose">
+      <h2>单电阻断路定位</h2>
+      <p class="hint">
+        输入 1～12 条<strong>不重复</strong>的非接地节点实测电压，每条含
+        <strong>有限电压值</strong>与<strong>正的有限绝对容差</strong>（单位均为 V）。
+        系统枚举「正常电路」与「每个电阻单独断路」的假设：断路即<strong>删除该支路</strong>、
+        保留原节点集合重新组装 MNA（不以大电阻近似）；断路后无唯一解的假设会单独列出原因，
+        其余假设继续检查。每个可求解假设的得分为各测点
+        「|预测 − 实测| ÷ 容差」的最大值，<strong>得分 ≤ 1 视为匹配</strong>，
+        结果按得分再按假设名称排序。恰有一个匹配时指出结论；多个匹配表示无法区分；
+        没有匹配表示实测数据不符合单电阻断路模型。诊断不会改动上方网表内容。
+      </p>
+      <div id="meas-rows"></div>
+      <div class="toolbar">
+        <button id="meas-add" type="button">添加测点</button>
+        <button id="diag-btn" class="primary">诊断断路</button>
+      </div>
+      <div id="diag-output" hidden>
+        <p id="diag-summary" class="summary"></p>
+        <table id="diag-table">
+          <thead>
+            <tr><th>假设</th><th>得分</th><th>是否匹配</th><th>说明</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div id="diag-details"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

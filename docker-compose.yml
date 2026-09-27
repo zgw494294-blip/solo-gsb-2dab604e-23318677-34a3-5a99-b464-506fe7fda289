@@ -1,0 +1,7 @@
+services:
+  web:
+    build: .
+    image: dc-circuit-solver
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
