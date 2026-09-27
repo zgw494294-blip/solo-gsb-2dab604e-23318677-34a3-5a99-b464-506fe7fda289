@@ -37,6 +37,15 @@ const thBtn = document.getElementById('th-btn');
 const thOutputEl = document.getElementById('th-output');
 const thSummaryEl = document.getElementById('th-summary');
 const thTbody = document.querySelector('#th-table tbody');
+const drNameEl = document.getElementById('dr-name');
+const drNodeEl = document.getElementById('dr-node');
+const drVoltageEl = document.getElementById('dr-voltage');
+const drRminEl = document.getElementById('dr-rmin');
+const drRmaxEl = document.getElementById('dr-rmax');
+const drBtn = document.getElementById('dr-btn');
+const drOutputEl = document.getElementById('dr-output');
+const drSummaryEl = document.getElementById('dr-summary');
+const drTbody = document.querySelector('#dr-table tbody');
 const measRowsEl = document.getElementById('meas-rows');
 const measAddBtn = document.getElementById('meas-add');
 const diagBtn = document.getElementById('diag-btn');
@@ -67,6 +76,7 @@ function showError(message) {
   resultsEl.hidden = true;
   sensOutputEl.hidden = true;
   thOutputEl.hidden = true;
+  drOutputEl.hidden = true;
   diagOutputEl.hidden = true;
 }
 
@@ -155,6 +165,7 @@ clearBtn.addEventListener('click', () => {
   resultsEl.hidden = true;
   sensOutputEl.hidden = true;
   thOutputEl.hidden = true;
+  drOutputEl.hidden = true;
   diagOutputEl.hidden = true;
   netlistEl.focus();
 });
@@ -326,6 +337,137 @@ thBtn.addEventListener('click', thevenin);
 for (const el of [thNode1El, thNode2El, thLoadEl]) {
   el.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') thevenin();
+  });
+}
+
+// ---------- 单电阻定值设计 ----------
+
+function renderDesign(data) {
+  drTbody.textContent = '';
+  const d = data.design;
+  const baseRows = [
+    { label: '被设计电阻', value: `${d.resistor}（原值 ${fmt(d.original_resistance)} Ω）` },
+    { label: '目标节点', value: `节点 ${d.node}` },
+    { label: '目标电压 V*', value: `${fmt(d.target_voltage)} V` },
+    { label: '阻值区间', value: `[${fmt(d.rmin)}, ${fmt(d.rmax)}] Ω` },
+    {
+      label: '目标节点当前电压',
+      value: `${fmt(d.original_voltage)} V`,
+      note: `电阻为原值 ${fmt(d.original_resistance)} Ω 时`,
+    },
+  ];
+
+  if (d.status === 'unique') {
+    drSummaryEl.textContent =
+      `结果：区间内有唯一解——把电阻 ${d.resistor} 换成 ` +
+      `${fmt(d.resistance)} Ω，目标节点 ${d.node} 的复算电压为 ` +
+      `${fmt(d.verify_voltage)} V（目标 ${fmt(d.target_voltage)} V，` +
+      `偏差 ${fmtSigned(d.verify_error)} V）。` +
+      '该阻值由电阻导纳对 MNA 矩阵的秩一变化解析反求，并已用替换后的电路复算验证。';
+    baseRows.push(
+      { label: '设计阻值 R*', value: `${fmt(d.resistance)} Ω`, isNum: true,
+        note: '区间内唯一解' },
+      { label: '复算电压', value: `${fmt(d.verify_voltage)} V`, isNum: true,
+        note: '替换后重新组装 MNA 求得' },
+      { label: '复算偏差', value: `${fmtSigned(d.verify_error)} V`, isNum: true,
+        note: '复算电压 − 目标电压' },
+    );
+  } else if (d.status === 'all_feasible') {
+    drSummaryEl.textContent =
+      `结果：整个区间 [${fmt(d.rmin)}, ${fmt(d.rmax)}] Ω 均可行——` +
+      `目标节点 ${d.node} 的电压不随电阻 ${d.resistor} 变化，恒为 ` +
+      `${fmt(d.original_voltage)} V，与目标电压 ` +
+      `${fmt(d.target_voltage)} V 一致（区间两端复算同样满足）。`;
+    baseRows.push(
+      { label: '可行区间',
+        value: `[${fmt(d.rmin)}, ${fmt(d.rmax)}] Ω`,
+        note: '区间内任意阻值均使目标节点电压达标' },
+    );
+  } else {
+    drSummaryEl.textContent = `结果：无解——${d.reason}`;
+  }
+
+  baseRows.push(
+    {
+      label: 'Rmin 处复算电压',
+      value: `${fmt(d.endpoint_min_voltage)} V`, isNum: true,
+      note: `电阻取 ${fmt(d.rmin)} Ω 时`,
+    },
+    {
+      label: 'Rmax 处复算电压',
+      value: `${fmt(d.endpoint_max_voltage)} V`, isNum: true,
+      note: `电阻取 ${fmt(d.rmax)} Ω 时`,
+    },
+  );
+
+  for (const row of baseRows) {
+    addRow(drTbody, [
+      { text: row.label },
+      { text: row.value, isNum: !!row.isNum },
+      { text: row.note || '' },
+    ]);
+  }
+  drOutputEl.hidden = false;
+}
+
+async function designResistor() {
+  clearError();
+  const resistor = drNameEl.value.trim();
+  const node = drNodeEl.value.trim();
+  const target_voltage = drVoltageEl.value.trim();
+  const rmin = drRminEl.value.trim();
+  const rmax = drRmaxEl.value.trim();
+  if (!resistor) {
+    showError('请填写要设计的现有电阻名称（如 R1）');
+    return;
+  }
+  if (!node) {
+    showError('请填写非接地目标节点编号');
+    return;
+  }
+  if (!target_voltage) {
+    showError('请填写目标电压（单位 V）');
+    return;
+  }
+  if (!rmin || !rmax) {
+    showError('请完整填写阻值闭区间 Rmin、Rmax（单位 Ω，0 < Rmin < Rmax）');
+    return;
+  }
+
+  drBtn.disabled = true;
+  try {
+    const resp = await fetch('/design-resistor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        netlist: netlistEl.value, resistor, node,
+        target_voltage, rmin, rmax,
+      }),
+    });
+    let data;
+    try {
+      data = await resp.json();
+    } catch {
+      showError(`服务器返回异常（HTTP ${resp.status}）`);
+      return;
+    }
+    // 出错时仅提示原因，网表与全部设计输入均保留
+    if (!data.ok) {
+      showError(data.error || '定值设计失败');
+      return;
+    }
+    renderDesign(data);
+  } catch {
+    showError('无法连接服务器，请检查服务是否正常运行');
+  } finally {
+    drBtn.disabled = false;
+  }
+}
+
+drBtn.addEventListener('click', designResistor);
+for (const el of [drNameEl, drNodeEl, drVoltageEl, drRminEl, drRmaxEl]) {
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') designResistor();
   });
 }
 

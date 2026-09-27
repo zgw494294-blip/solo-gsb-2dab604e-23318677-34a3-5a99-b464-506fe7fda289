@@ -617,3 +617,232 @@ def diagnose_open(elements: list[Element], nodes: list[int],
         'matches': [r['hypothesis'] for r in matched],
         'conclusion': conclusion,
     }
+
+
+def _aux_solve(A, rhs: list[float], size: int, tol: float = 1e-6) -> list[float]:
+    """在已组装的 MNA 系数矩阵 A 上解一个自定义右端 rhs，并做残差校验。
+
+    调用前应已确认原电路有唯一解（A 非奇异），用于灵敏度/等效类辅助求解。
+    """
+    a_mat = np.array(A, dtype=float)
+    try:
+        y = np.linalg.solve(a_mat, np.array(rhs, dtype=float))
+    except np.linalg.LinAlgError as exc:
+        raise NoUniqueSolutionError(
+            '无唯一解：电路方程组奇异（可能存在仅由电流源构成的割集等约束冲突）'
+        ) from exc
+    y = [float(v) for v in y]
+    residual = max(
+        (abs(sum(A[i][j] * y[j] for j in range(size)) - rhs[i])
+         for i in range(size)),
+        default=0.0)
+    if any(not math.isfinite(v) for v in y) or residual > tol:
+        raise NoUniqueSolutionError('数值求解失败：电路可能无唯一解或严重病态')
+    return y
+
+
+def design_resistor(elements: list[Element], nodes: list[int],
+                    resistor_name: str, target_node: int,
+                    target_voltage: float, rmin: float, rmax: float) -> dict:
+    """单电阻定值设计：反求把某电阻换成多大阻值，可使指定非接地节点
+    达到给定目标电压，搜索范围限定为闭区间 [rmin, rmax]（Ω）。
+
+    利用电阻导纳对 MNA 矩阵的**秩一变化**求解析关系。设原方程 A·x = z，
+    被设计电阻 R0 接在 p、q 之间（导纳 g0 = 1/R0），关联向量 b = e_p − e_q
+    （接地端对应项省略）。换成导纳 g = 1/R 后：
+
+        A(g) = A + (g − g0)·b b^T，右端 z 不变。
+
+    由 Sherman–Morrison 公式（u = A⁻¹b）：
+
+        x(g) = x − (g−g0)·u·(b^T x) / (1 + (g−g0)·b^T u)
+
+    记 s = b^T u（≥0）、α = b^T x（电阻两端电压）、t = u_k、v_t = x_k
+    （k 为目标节点），则目标节点电压是 g 的分式线性函数：
+
+        V_k(g) = ((v_t·s − t·α)·g + (v_t·β + g0·t·α)) / (s·g + β)，
+        β = 1 − g0·s（s 为从该电阻端口看进去的等效电阻，恒 ≥ 0；
+        若删除该电阻后端口悬空则 β = 0，此时分母在 g = 0 处取零）。
+
+    据此直接解出满足 V_k(g*) = 目标电压的 g*（唯一根，除非 t·α = 0，
+    此时目标节点电压与该电阻无关），再换成 R* = 1/g* 并用替换后的完整
+    电路重新组装、求解 MNA 复算验证——不使用局部导数的一阶近似，也不做
+    固定步长扫描。
+
+    返回状态 status：
+    - 'unique'：区间内唯一解，附 resistance 与复算电压 verify_voltage；
+    - 'all_feasible'：目标节点电压不随该电阻变化且恰好等于目标值，
+      整个 [rmin, rmax] 均为可行区间；
+    - 'none'：区间内无解，reason 说明原因（不可达范围/需非正电阻等），
+      并附区间两端点的复算电压。
+
+    计算只在元件列表的副本上进行，不改写原网表元件。
+    """
+    # ---- 参数校验 ----
+    if not isinstance(resistor_name, str) or not resistor_name.strip():
+        raise NetlistError('请给出要设计的电阻名称')
+    res = next(
+        (e for e in elements
+         if e.kind == 'R' and e.name.lower() == resistor_name.strip().lower()),
+        None)
+    if res is None:
+        rnames = '、'.join(e.name for e in elements if e.kind == 'R')
+        extra = f'（现有电阻：{rnames}）' if rnames else '（当前网表中没有电阻）'
+        raise NetlistError(
+            f'网表中不存在名为 "{resistor_name}" 的电阻{extra}')
+    if target_node == GROUND:
+        raise NetlistError('节点 0 为接地节点，电压恒为 0，不能作为设计目标')
+    if target_node not in nodes:
+        raise NetlistError(
+            f'目标节点 {target_node} 不存在：当前网表的非接地节点为 '
+            f'{"、".join(map(str, nodes))}')
+    for key, val in (('目标电压', target_voltage),
+                     ('Rmin', rmin), ('Rmax', rmax)):
+        if not isinstance(val, (int, float)) or isinstance(val, bool) \
+                or not math.isfinite(float(val)):
+            raise NetlistError(f'{key}必须为有限数值')
+    target_voltage, rmin, rmax = (float(target_voltage),
+                                  float(rmin), float(rmax))
+    if not (rmin > 0 and rmax > 0):
+        raise NetlistError(
+            f'阻值区间必须为正数（当前 Rmin={rmin}，Rmax={rmax}，单位 Ω）')
+    if not rmin < rmax:
+        raise NetlistError(
+            f'阻值区间必须满足 0 < Rmin < Rmax（当前 Rmin={rmin}，'
+            f'Rmax={rmax}，单位 Ω）')
+
+    # ---- 原电路求解（无唯一解则直接抛出），并组装辅助解 u = A⁻¹b ----
+    x, A, index, _ = _solve_mna(elements, nodes)
+    size = len(x)
+
+    def xv(node: int) -> float:
+        return x[index[node]] if node in index else 0.0
+
+    v_t = xv(target_node)
+    alpha = xv(res.n1) - xv(res.n2)   # 电阻两端电压（起点 − 终点）
+    g0 = 1.0 / res.value
+
+    # b = e_n1 − e_n2（接地端不在 MNA 未知量中，略去）
+    rhs = [0.0] * size
+    a = index.get(res.n1)
+    b = index.get(res.n2)
+    if a is not None:
+        rhs[a] += 1.0
+    if b is not None:
+        rhs[b] -= 1.0
+    u = _aux_solve(A, rhs, size)
+
+    def uv(node: int) -> float:
+        return u[index[node]] if node in index else 0.0
+
+    s = uv(res.n1) - uv(res.n2)      # b^T A⁻¹ b ≥ 0（端口看进去的等效电阻）
+    t = uv(target_node)              # (A⁻¹ b)_k
+    # β ≥ 0（Schur 补：β = 1/(1 + g0·s)，s 为移除该电阻后的端口等效电阻），
+    # 删除该电阻后端口悬空（s 无界）对应极限 β = 0
+    beta = 1.0 - g0 * s
+    if -1e-12 < beta < 0:
+        beta = 0.0
+
+    def voltage_at(rnew: float) -> float:
+        """把该电阻换成 rnew 后用完整电路重新求解，返回目标节点复算电压。"""
+        variant = [Element(e.name, e.kind, e.n1, e.n2,
+                           rnew if e is res else e.value)
+                   for e in elements]
+        xx, _, vindex, _ = _solve_mna(variant, nodes)
+        return xx[vindex[target_node]]
+
+    v_lo = voltage_at(rmin)          # R = Rmin 时复算电压
+    v_hi = voltage_at(rmax)          # R = Rmax 时复算电压
+
+    base = {
+        'resistor': res.name,
+        'node': target_node,
+        'target_voltage': target_voltage,
+        'rmin': rmin, 'rmax': rmax,
+        'original_resistance': res.value,
+        'original_voltage': v_t,
+        'endpoint_min_voltage': v_lo,
+        'endpoint_max_voltage': v_hi,
+    }
+    tol = 1e-8 * max(1.0, abs(target_voltage), abs(v_t),
+                     abs(v_lo), abs(v_hi))
+
+    # V_k(g) 是否恒为常数：dV/dg = t·α/(s·g + β)²，t·α = 0 即与电阻无关
+    coeff_scale = max(1.0, abs(v_t * s), abs(t * alpha),
+                      abs(v_t * beta), abs(g0 * t * alpha))
+    is_constant = abs(t * alpha) <= 1e-10 * coeff_scale
+
+    if is_constant:
+        if abs(v_lo - target_voltage) <= tol \
+                and abs(v_hi - target_voltage) <= tol:
+            return {**base, 'status': 'all_feasible'}
+        return {**base, 'status': 'none',
+                'reason':
+                    f'目标节点 {target_node} 的电压不受电阻 {res.name} 取值影响，'
+                    f'恒为 {v_t:.6g} V（区间两端复算：{v_lo:.6g} V、'
+                    f'{v_hi:.6g} V），无法通过改变该电阻达到目标电压 '
+                    f'{target_voltage:.6g} V'}
+
+    # 解分式线性方程 V_k(g*) = V*：
+    # g* = (g0·t·α − β·(V*−v_t)) / (s·(V*−v_t) + t·α)
+    dv = target_voltage - v_t
+    coef_a = s * dv + t * alpha
+    coef_b = g0 * t * alpha - beta * dv
+    a_scale = max(1.0, abs(t * alpha), abs(s * dv))
+    if abs(coef_a) <= 1e-12 * a_scale:
+        # 理论上非恒定函数不会出现；数值退化时按端点复算判定无解
+        return {**base, 'status': 'none',
+                'reason':
+                    f'目标电压 {target_voltage:.6g} V 在阻值区间 '
+                    f'[{rmin:g}, {rmax:g}] Ω 内不可达（Rmin 时复算 '
+                    f'{v_lo:.6g} V，Rmax 时复算 {v_hi:.6g} V）'}
+
+    g_star = coef_b / coef_a
+    if g_star <= 0.0:
+        return {**base, 'status': 'none',
+                'reason':
+                    f'解析解对应导纳 g = {g_star:.6g} S（非正，即需零、负电阻'
+                    '或无穷大电阻），在有限正电阻范围内无解；'
+                    f'区间 [{rmin:g}, {rmax:g}] Ω 内目标节点电压的复算范围为 '
+                    f'{min(v_lo, v_hi):.6g}～{max(v_lo, v_hi):.6g} V，'
+                    f'目标电压 {target_voltage:.6g} V 超出该范围'}
+
+    r_star = 1.0 / g_star
+    # 端点处的浮点误差吸附
+    bound_tol = 1e-9 * max(1.0, abs(rmin), abs(rmax))
+    if rmin <= r_star <= rmax or (
+            rmin - bound_tol <= r_star < rmin) or (
+            rmax < r_star <= rmax + bound_tol):
+        r_star = min(max(r_star, rmin), rmax)
+    else:
+        return {**base, 'status': 'none',
+                'reason':
+                    f'解析解 R = {r_star:.6g} Ω 落在指定区间 '
+                    f'[{rmin:g}, {rmax:g}] Ω 之外：该区间内目标节点电压随阻值'
+                    f'{"递减" if t * alpha < 0 else "递增"}，复算范围为 '
+                    f'{min(v_lo, v_hi):.6g}～{max(v_lo, v_hi):.6g} V，'
+                    f'目标电压 {target_voltage:.6g} V 不可达'}
+
+    # 用替换后的完整电路复算；必要时用同一解析导数做不超过 3 次数值校正
+    verify = voltage_at(r_star)
+    for _ in range(3):
+        if abs(verify - target_voltage) <= tol:
+            break
+        # dV/dR = t·α/(βR + s)²（秩一关系给出的解析导数，仅用于消去舍入误差）
+        dvr = t * alpha / (beta * r_star + s) ** 2
+        if dvr == 0.0 or not math.isfinite(dvr):
+            break
+        r_star = min(max(r_star - (verify - target_voltage) / dvr,
+                         rmin), rmax)
+        verify = voltage_at(r_star)
+
+    if abs(verify - target_voltage) > tol:
+        return {**base, 'status': 'none',
+                'reason':
+                    f'解析解 R = {r_star:.6g} Ω 的复算电压为 {verify:.6g} V，'
+                    f'与目标电压 {target_voltage:.6g} V 的偏差超出数值容差，'
+                    '电路可能严重病态'}
+
+    return {**base, 'status': 'unique', 'resistance': r_star,
+            'verify_voltage': verify,
+            'verify_error': verify - target_voltage}

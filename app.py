@@ -1,12 +1,13 @@
-"""Flask 入口：提供页面与 /solve、/sensitivity、/thevenin、/diagnose-open 接口。"""
+"""Flask 入口：提供页面与 /solve、/sensitivity、/thevenin、/diagnose-open、
+/design-resistor 接口。"""
 
 import math
 
 from flask import Flask, jsonify, render_template, request
 
 from solver import (NetlistError, NoUniqueSolutionError, compute_sensitivity,
-                    compute_thevenin, diagnose_open, parse_netlist,
-                    solve_circuit)
+                    compute_thevenin, design_resistor, diagnose_open,
+                    parse_netlist, solve_circuit)
 
 app = Flask(__name__)
 
@@ -188,6 +189,62 @@ def diagnose_open_endpoint():
     except (NetlistError, NoUniqueSolutionError) as exc:
         return jsonify(ok=False, error=str(exc))
     return jsonify(ok=True, **result)
+
+
+def _parse_finite(payload: dict, key: str, label: str,
+                  positive: bool = False) -> float:
+    """从请求体提取一个有限数值字段；positive 时还要求为正数。"""
+    raw = payload.get(key)
+    if isinstance(raw, bool):
+        raise NetlistError(f'{label}非法，应为数值')
+    try:
+        val = float(str(raw).strip())
+    except (ValueError, TypeError):
+        raise NetlistError(f'{label} "{raw}" 不是合法的数值') from None
+    if not math.isfinite(val):
+        raise NetlistError(f'{label}必须为有限值（当前为 {raw}）')
+    if positive and val <= 0:
+        raise NetlistError(f'{label}必须为正数（当前为 {raw}）')
+    return val
+
+
+@app.post('/design-resistor')
+def design_resistor_endpoint():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get('netlist', '')
+    if not isinstance(text, str):
+        return jsonify(ok=False, error='请求格式错误：netlist 必须是字符串'), 400
+    name = payload.get('resistor')
+    if not isinstance(name, str) or not name.strip():
+        return jsonify(ok=False, error='请给出要设计的电阻名称（resistor 字段）')
+    raw_node = payload.get('node')
+    if isinstance(raw_node, bool):
+        return jsonify(ok=False, error='目标节点编号非法，应为非接地的非负整数')
+    try:
+        node = int(str(raw_node).strip(), 10)
+    except (ValueError, TypeError):
+        return jsonify(ok=False,
+                       error=f'目标节点编号 "{raw_node}" 非法，应为非接地的非负整数')
+    if node <= 0:
+        return jsonify(ok=False,
+                       error=f'目标节点编号 {node} 非法：应为现有非接地节点（不能是地节点 0）')
+    try:
+        target = _parse_finite(payload, 'target_voltage', '目标电压')
+        rmin = _parse_finite(payload, 'rmin', '阻值下限 Rmin', positive=True)
+        rmax = _parse_finite(payload, 'rmax', '阻值上限 Rmax', positive=True)
+    except NetlistError as exc:
+        return jsonify(ok=False, error=str(exc))
+    if not rmin < rmax:
+        return jsonify(ok=False,
+                       error=f'阻值区间非法：必须满足 0 < Rmin < Rmax（当前 '
+                             f'Rmin={rmin}，Rmax={rmax}，单位 Ω）')
+    try:
+        elements, nodes = parse_netlist(text)
+        result = design_resistor(elements, nodes, name.strip(), node,
+                                 target, rmin, rmax)
+    except (NetlistError, NoUniqueSolutionError) as exc:
+        return jsonify(ok=False, error=str(exc))
+    return jsonify(ok=True, design=result)
 
 
 if __name__ == '__main__':

@@ -46,8 +46,8 @@ sys.modules['numpy'] = fake_np
 
 import solver  # noqa: E402
 from solver import (NetlistError, NoUniqueSolutionError, compute_sensitivity,  # noqa: E402
-                    compute_thevenin, diagnose_open, parse_netlist,
-                    solve_circuit)
+                    compute_thevenin, design_resistor, diagnose_open,
+                    parse_netlist, solve_circuit)
 
 # ---------- 测试工具 ----------
 PASSED = 0
@@ -544,6 +544,176 @@ expect_diag_error(DIV, [M(2, float('nan'), 1)], '有限',
 # 正常电路无唯一解时诊断前提不成立，直接报错
 expect_diag_error('I1 1 0 1', [M(1, 1, 1)], '悬浮',
                   '断路定位：正常电路无唯一解', NoUniqueSolutionError)
+
+# ---------- 单电阻定值设计 ----------
+print('== 单电阻定值设计 ==')
+
+DIV = 'V1 1 0 10\nR1 1 2 5\nR2 2 0 5'
+
+
+def dr_text(text, name, node, vt, lo, hi):
+    elements, nodes = parse_netlist(text)
+    return design_resistor(elements, nodes, name, node, vt, lo, hi)
+
+
+# 分压电路：调 R1 使 V(2)=8V，手算 R1 = R2·(V1/V2 − 1) = 5·(10/8−1) = 1.25Ω
+r = dr_text(DIV, 'R1', 2, 8.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 1.25)
+      and close(r['verify_voltage'], 8.0) and close(r['verify_error'], 0.0),
+      '定值设计：分压器调 R1 使节点 2 达 8V（R*=1.25Ω）')
+check(close(r['original_resistance'], 5) and close(r['original_voltage'], 5),
+      '定值设计：回传原阻值与原电压')
+
+# 端点复算：Rmin=5 时 V2=5，Rmax→大 时 V2→0
+check(close(r['endpoint_min_voltage'], 10 * 5 / (0.1 + 5))
+      and close(r['endpoint_max_voltage'], 10 * 5 / (100 + 5)),
+      '定值设计：区间两端点复算电压')
+
+# 目标等于当前值：解析解为原阻值
+r = dr_text(DIV, 'R1', 2, 5.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 5.0),
+      '定值设计：目标等于当前值时 R*=原值')
+
+# 调接地电阻：I1 0 1 2 + R1 1 0，V(1)=2·R1，目标 4V -> R1=2Ω
+r = dr_text('I1 0 1 2\nR1 1 0 4', 'R1', 1, 4.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 2.0)
+      and close(r['verify_voltage'], 4.0),
+      '定值设计：电流源接地电阻自身节点（R*=2Ω）')
+
+# 混合电路：调 R3 使 V(3)=12V -> R3=9Ω（节点 2 电位 7.5V 不参与变化）
+MIX = 'V1 1 0 12\nR1 1 2 6\nR2 2 0 6\nR3 2 3 12\nI1 0 3 0.5'
+r = dr_text(MIX, 'R3', 3, 12.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 9.0)
+      and close(r['verify_voltage'], 12.0),
+      '定值设计：混合电路调 R3 使节点 3 达 12V（R*=9Ω）')
+
+# 电阻方向（起点/终点）反过来定义，设计结果不变
+r = dr_text('V1 1 0 10\nR1 2 1 5\nR2 2 0 5', 'R1', 2, 8.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 1.25),
+      '定值设计：电阻方向反向时结果一致')
+
+# 名称不区分大小写
+r = dr_text(DIV, 'r1', 2, 8.0, 0.1, 100.0)
+check(r['status'] == 'unique' and r['resistor'] == 'R1',
+      '定值设计：电阻名称不区分大小写')
+
+# 负目标电压
+r = dr_text('V1 1 0 -10\nR1 1 2 5\nR2 2 0 5', 'R1', 2, -8.0, 0.1, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 1.25)
+      and close(r['verify_voltage'], -8.0),
+      '定值设计：负目标电压')
+
+# 解恰在区间端点：Rmin=2 时 V2 = 50/7
+r = dr_text(DIV, 'R1', 2, 50 / 7, 2.0, 100.0)
+check(r['status'] == 'unique' and close(r['resistance'], 2.0)
+      and close(r['verify_voltage'], 50 / 7),
+      '定值设计：唯一解恰在区间下端点')
+r = dr_text(DIV, 'R1', 2, 50 / 7, 0.1, 2.0)
+check(r['status'] == 'unique' and close(r['resistance'], 2.0),
+      '定值设计：唯一解恰在区间上端点')
+
+# 全区间可行：平衡桥，桥电阻 R5 两端等电位，节点 3 恒为 5V
+BRIDGE = ('V1 1 0 10\nR1 1 3 10\nR2 1 4 10\nR3 3 0 10\n'
+          'R4 4 0 10\nR5 3 4 5')
+r = dr_text(BRIDGE, 'R5', 3, 5.0, 0.1, 100.0)
+check(r['status'] == 'all_feasible'
+      and close(r['endpoint_min_voltage'], 5)
+      and close(r['endpoint_max_voltage'], 5),
+      '定值设计：平衡桥中目标电压与桥电阻无关且达标 -> 全区间可行')
+
+# 同一恒定函数，目标不符 -> 无解并说明恒为多少
+r = dr_text(BRIDGE, 'R5', 3, 6.0, 0.1, 100.0)
+check(r['status'] == 'none' and '不受电阻 R5' in r['reason'],
+      '定值设计：目标节点电压与该电阻无关且不达标 -> 无解')
+
+# 目标节点被理想电压源钳位：节点 1 恒为 10V
+r = dr_text(DIV, 'R1', 1, 10.0, 0.1, 100.0)
+check(r['status'] == 'all_feasible',
+      '定值设计：目标节点被电压源钳位且目标相符 -> 全区间可行')
+r = dr_text(DIV, 'R1', 1, 9.0, 0.1, 100.0)
+check(r['status'] == 'none' and '不受电阻 R1' in r['reason'],
+      '定值设计：钳位节点目标不符 -> 无解')
+
+# 无解：解落在区间之外（8V 需要 1.25Ω，区间 [10,100] 不可达）
+r = dr_text(DIV, 'R1', 2, 8.0, 10.0, 100.0)
+check(r['status'] == 'none' and '不可达' in r['reason']
+      and close(r['endpoint_min_voltage'], 10 * 5 / 15)
+      and close(r['endpoint_max_voltage'], 10 * 5 / 105),
+      '定值设计：解析解在区间外 -> 无解并给可达范围')
+
+# 无解：目标超过开路极限（V2 范围 (0,10)，目标 12V 需负电阻）
+r = dr_text(DIV, 'R1', 2, 12.0, 0.1, 100.0)
+check(r['status'] == 'none' and '非正' in r['reason'],
+      '定值设计：目标超出正电阻可达范围 -> 无解（需非正/无穷电阻）')
+
+# 无解：目标等于 R→∞ 的开路极限 0V，有限阻值只能趋近
+r = dr_text(DIV, 'R1', 2, 0.0, 0.1, 100.0)
+check(r['status'] == 'none', '定值设计：目标仅在无穷大电阻极限可达 -> 无解')
+
+# 纯电阻（无独立源）网络：节点电压恒为 0
+r = dr_text('R1 1 0 10\nR2 1 2 10\nR3 2 0 10', 'R2', 1, 0.0, 1.0, 100.0)
+check(r['status'] == 'all_feasible',
+      '定值设计：无独立源网络目标 0V -> 全区间可行')
+r = dr_text('R1 1 0 10\nR2 1 2 10\nR3 2 0 10', 'R2', 1, 1.0, 1.0, 100.0)
+check(r['status'] == 'none', '定值设计：无独立源网络目标非 0 -> 无解')
+
+
+def expect_dr_error(text, name, node, vt, lo, hi, keyword, label,
+                    exc_type=NetlistError):
+    elements, nodes = parse_netlist(text)
+    try:
+        design_resistor(elements, nodes, name, node, vt, lo, hi)
+    except exc_type as exc:
+        check(keyword in str(exc), f'{label}（提示包含「{keyword}」）-> {exc}')
+        return
+    except Exception as exc:  # noqa: BLE001
+        check(False, f'{label}（抛出了错误类型 {type(exc).__name__}: {exc}）')
+        return
+    check(False, f'{label}（未抛出 {exc_type.__name__}）')
+
+
+expect_dr_error(DIV, 'R9', 2, 8, 1, 10, '不存在', '定值设计：电阻不存在')
+expect_dr_error(DIV, 'V1', 2, 8, 1, 10, '不存在', '定值设计：名称指向电压源')
+expect_dr_error('V1 1 0 4\nI1 0 1 1', 'R1', 1, 4, 1, 10, '没有电阻',
+                '定值设计：网表中没有电阻')
+expect_dr_error(DIV, 'R1', 0, 8, 1, 10, '接地', '定值设计：目标节点为地')
+expect_dr_error(DIV, 'R1', 7, 8, 1, 10, '不存在', '定值设计：目标节点不存在')
+expect_dr_error(DIV, 'R1', 2, float('inf'), 1, 10, '有限',
+                '定值设计：无穷目标电压')
+expect_dr_error(DIV, 'R1', 2, 8, 0, 10, '正数', '定值设计：Rmin 为 0')
+expect_dr_error(DIV, 'R1', 2, 8, -1, 10, '正数', '定值设计：Rmin 为负')
+expect_dr_error(DIV, 'R1', 2, 8, 5, 5, 'Rmin < Rmax',
+                '定值设计：Rmin 等于 Rmax')
+expect_dr_error(DIV, 'R1', 2, 8, 10, 5, 'Rmin < Rmax',
+                '定值设计：Rmin 大于 Rmax')
+expect_dr_error(DIV, 'R1', 2, 8, float('nan'), 10, '有限',
+                '定值设计：NaN 区间')
+expect_dr_error(DIV, 'R1', 2, 8, float('inf'), 10, '有限',
+                '定值设计：无穷区间')
+
+# 原电路无唯一解时沿用原报错
+expect_dr_error('I1 1 0 1\nR1 1 2 5', 'R1', 1, 0.5, 0.1, 100,
+                '悬浮', '定值设计：原电路无唯一解', NoUniqueSolutionError)
+
+# 计算不改写原网表元件
+els, nds = parse_netlist(DIV)
+design_resistor(els, nds, 'R1', 2, 8.0, 0.1, 100.0)
+check(els[1].value == 5 and els[1].n1 == 1 and els[1].n2 == 2,
+      '定值设计：计算后原网表元件保持不变')
+
+# 解析解与逐点精确求解交叉验证：取若干阻值，先用完整 MNA 求出该阻值下的
+# 节点电压作为目标，再用秩一解析关系反求，应精确回到同一阻值（不涉及近似）
+elements, nodes = parse_netlist(MIX)
+for rnew in (0.5, 1.0, 9.0, 20.0, 80.0):
+    variant = [solver.Element(e.name, e.kind, e.n1, e.n2,
+                              rnew if e.name == 'R3' else e.value)
+               for e in elements]
+    v_target = {v['node']: v['voltage']
+                for v in solve_circuit(variant, nodes)[0]}[3]
+    rr = design_resistor(elements, nodes, 'R3', 3, v_target, 0.1, 100.0)
+    check(rr['status'] == 'unique' and close(rr['resistance'], rnew, tol=1e-7)
+          and close(rr['verify_voltage'], v_target),
+          f'定值设计：以 R={rnew}Ω 复算电压为目标时反求回同一阻值')
 
 print(f'\n通过 {PASSED} 项，失败 {FAILED} 项')
 sys.exit(1 if FAILED else 0)

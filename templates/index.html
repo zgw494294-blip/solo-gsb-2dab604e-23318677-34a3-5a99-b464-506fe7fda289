@@ -110,6 +110,48 @@
       </div>
     </section>
 
+    <section id="design-resistor">
+      <h2>单电阻定值设计</h2>
+      <p class="hint">
+        选择网表中一个<strong>现有电阻</strong>与一个<strong>非接地目标节点</strong>，
+        给出目标电压（V）和阻值闭区间 <strong>[Rmin, Rmax]</strong>（有限值，0 &lt; Rmin &lt; Rmax，单位 Ω）。
+        保持其余元件不变，系统利用该电阻导纳对 MNA 矩阵的<strong>秩一变化</strong>
+        （Sherman–Morrison 公式）反求使目标节点达到指定电压所需的阻值，
+        并用替换后的完整电路重新组装 MNA <strong>复算验证</strong>
+        （不使用局部导数的一阶近似，也不做固定步长扫描）。
+        区间内有唯一解时给出阻值与复算电压；目标节点电压与该电阻无关且恰好达标时，
+        整个区间均可行；无解时说明原因（目标电压超出区间可达范围、需要非正电阻等）。
+        计算不会改写上方网表。
+      </p>
+      <div class="toolbar">
+        <label for="dr-name">电阻</label>
+        <input id="dr-name" type="text" size="10"
+               placeholder="如 R1" autocomplete="off">
+        <label for="dr-node">目标节点</label>
+        <input id="dr-node" type="text" inputmode="numeric" size="6"
+               placeholder="非接地，如 2" autocomplete="off">
+        <label for="dr-voltage">目标电压 (V)</label>
+        <input id="dr-voltage" type="text" inputmode="decimal" size="8"
+               placeholder="如 8.0" autocomplete="off">
+        <label for="dr-rmin">Rmin (Ω)</label>
+        <input id="dr-rmin" type="text" inputmode="decimal" size="8"
+               placeholder="如 0.1" autocomplete="off">
+        <label for="dr-rmax">Rmax (Ω)</label>
+        <input id="dr-rmax" type="text" inputmode="decimal" size="8"
+               placeholder="如 100" autocomplete="off">
+        <button id="dr-btn" class="primary">定值设计</button>
+      </div>
+      <div id="dr-output" hidden>
+        <p id="dr-summary" class="summary"></p>
+        <table id="dr-table">
+          <thead>
+            <tr><th>项目</th><th>数值</th><th>说明</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="diagnose">
       <h2>单电阻断路定位</h2>
       <p class="hint">
